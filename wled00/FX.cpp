@@ -10,6 +10,7 @@
   Modified heavily for WLED
 */
 
+
 #include "wled.h"
 #include "FX.h"
 #include "fcn_declare.h"
@@ -125,6 +126,164 @@ uint16_t mode_static(void) {
   return strip.isOffRefreshRequired() ? FRAMETIME : 350;
 }
 static const char _data_FX_MODE_STATIC[] PROGMEM = "Solid";
+
+
+
+
+
+/*
+ * Custom Effect: "Stairs" - Wipe On, Stay On, Fade Out
+ * WLED-Style: Kontinuierliche Berechnung ohne Phasen
+ */
+
+ auto dimColor = [](uint32_t col, uint8_t brightness) -> uint32_t {
+  uint8_t r = ((col >> 16) & 0xFF) * brightness / 255;
+  uint8_t g = ((col >> 8) & 0xFF) * brightness / 255;
+  uint8_t b = (col & 0xFF) * brightness / 255;
+  uint8_t w = ((col >> 24) & 0xFF) * brightness / 255;  // ← WICHTIG!
+  
+  return ((uint32_t)w << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+};
+
+/*
+ * Custom Effect: "Stairs" - Wipe On, Stay On, Fade Out
+ * WLED-Style: Kontinuierliche Berechnung ohne Phasen
+ * Mit RGBW-Support und Gamma-Correction
+ */
+uint16_t mode_stairs(bool inverted) {
+  
+  if (SEGLEN <= 1) return mode_static(); 
+  
+  // Bei Effektwechsel oder Init: Erzwinge Start bei Wipe-Phase
+  if (SEGENV.call == 0) {
+    // Setze strip.now so dass wir am Anfang des Zyklus starten
+    SEGENV.aux0 = strip.now;  // Merke dir den Startzeitpunkt
+  } 
+  
+  // Zeitdauern aus Slidern (in ms)
+  uint32_t wipeDuration = map(SEGMENT.speed, 0, 255, 500, 10000); 
+  uint32_t holdDuration = map(SEGMENT.intensity, 0, 255, 500, 20000); 
+  uint32_t fadeDuration = map(SEGMENT.custom1, 0, 255, 500, 5000);
+  
+  // Wipe Tail Länge (Anzahl LEDs)
+  uint16_t wipeTailLength = map(SEGMENT.custom2, 0, 255, 0, SEGLEN / 2); 
+  
+  // Gesamtzykluszeit
+  uint32_t cycleTime = wipeDuration + holdDuration + fadeDuration + 500; // +500ms Pause
+  
+  // Aktuelle Position im Zyklus (0 bis cycleTime-1)
+  // Berechne relativ zum Startzeitpunkt
+  uint32_t pos = (strip.now - SEGENV.aux0) % cycleTime;
+  
+  uint32_t color = SEGCOLOR(1);
+  
+  // ===== PHASE 1: WIPE (0 bis wipeDuration) =====
+  if (pos < wipeDuration) {
+    
+    // Wipe-Progress: 0.0 bis 1.0
+    float wipeProgress = (float)pos / (float)wipeDuration;
+    
+    // Aktuelle Wipe-Position (kann über SEGLEN hinausgehen für smooth finish)
+    float wipePos = wipeProgress * (SEGLEN + wipeTailLength);
+    
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      // Invertierung: Kehre die Laufrichtung um
+      uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      
+      // Bei SEGMENT.reverse die Richtung zusätzlich umkehren
+      if (SEGMENT.reverse) {
+        idx = SEGLEN - 1 - idx;
+      }
+      
+      // Distanz zur Wipe-Front
+      float distanceToFront = wipePos - i;
+      
+      if (distanceToFront >= wipeTailLength) {
+        // Voll beleuchtet - vor dem Tail
+        SEGMENT.setPixelColor(idx, color);
+      } 
+      else if (distanceToFront > 0) {
+        // Im Tail - sanfter Gradient von 100% zu 0%
+        float tailProgress = distanceToFront / (float)wipeTailLength;
+        uint8_t tailBri = (uint8_t)(255.0f * tailProgress);
+        SEGMENT.setPixelColor(idx, dimColor(color, tailBri));
+      } 
+      else {
+        // Noch nicht erreicht - komplett aus
+        SEGMENT.setPixelColor(idx, BLACK);
+      }
+    }
+  }
+  
+  // ===== PHASE 2: HOLD (wipeDuration bis wipeDuration+holdDuration) =====
+  else if (pos < wipeDuration + holdDuration) {
+    
+    // Alle LEDs voll an
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
+      SEGMENT.setPixelColor(idx, color);
+    }
+  }
+  
+  // ===== PHASE 3: FADE (wipeDuration+holdDuration bis wipeDuration+holdDuration+fadeDuration) =====
+  else if (pos < wipeDuration + holdDuration + fadeDuration) {
+    
+    uint32_t fadeStart = wipeDuration + holdDuration;
+    uint32_t fadePos = pos - fadeStart;
+    
+    // Fade-Progress: 0.0 bis 1.0
+    float fadeProgress = (float)fadePos / (float)fadeDuration;
+    
+    // Helligkeit von 255 nach 0
+    uint8_t bri = (uint8_t)(255.0f * (1.0f - fadeProgress));
+    
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
+      SEGMENT.setPixelColor(idx, dimColor(color, bri));
+    }
+  }
+  
+  // ===== PHASE 4: PAUSE (Rest des Zyklus) =====
+  else {
+    
+    // Alle LEDs aus
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
+      SEGMENT.setPixelColor(idx, BLACK);
+    }
+  }
+  
+  // Automatischer Neustart wenn wir wieder am Zyklusanfang sind
+  // (pos springt von cycleTime-1 zurück auf 0 durch Modulo)
+  if (pos < 10 && SEGENV.step == 1) {  // Erste 10ms des neuen Zyklus
+    SEGENV.aux0 = strip.now;  // Neuer Startzeitpunkt
+    SEGENV.step = 0;
+  }
+  
+  // Markiere Zyklusende in der Pause-Phase
+  if (pos >= wipeDuration + holdDuration + fadeDuration + 450) {
+    SEGENV.step = 1;  // Zyklus fast vorbei
+  }
+  
+  return FRAMETIME;
+}
+
+
+// Wrapper-Funktionen für beide Richtungen
+uint16_t mode_stairs_forward(void) {
+  return mode_stairs(false);  // Von unten nach oben (LED 0 → LED N)
+}
+// Für Stairs Up (forward)
+static const char _data_FX_MODE_STAIRS_FORWARD[] PROGMEM = "Stairs Up@Wipe-Time,Hold-Time,Fade-Time,Wipe Tail;,!;c1;pal=0,s=128,i=128";
+
+uint16_t mode_stairs_reverse(void) {
+  return mode_stairs(true);   // Von oben nach unten (LED N → LED 0)
+}
+// Für Stairs Down (reverse)
+static const char _data_FX_MODE_STAIRS_REVERSE[] PROGMEM = "Stairs Down@Wipe-Time,Hold-Time,Fade-Time,Wipe Tail;,!;c1;pal=0,s=128,i=128";
 
 /*
  * Copy a segment and perform (optional) color adjustments
@@ -11022,5 +11181,8 @@ addEffect(FX_MODE_PS1DSONICSTREAM, &mode_particle1DsonicStream, _data_FX_MODE_PS
 addEffect(FX_MODE_PS1DSONICBOOM, &mode_particle1DsonicBoom, _data_FX_MODE_PS_SONICBOOM);
 addEffect(FX_MODE_PS1DSPRINGY, &mode_particleSpringy, _data_FX_MODE_PS_SPRINGY);
 #endif // WLED_DISABLE_PARTICLESYSTEM1D
+
+addEffect(FX_MODE_STAIRS_UP, &mode_stairs_forward, _data_FX_MODE_STAIRS_FORWARD);
+addEffect(FX_MODE_STAIRS_DOWN, &mode_stairs_reverse, _data_FX_MODE_STAIRS_REVERSE);
 
 }
