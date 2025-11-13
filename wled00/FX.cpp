@@ -154,10 +154,13 @@ uint16_t mode_stairs(bool inverted) {
   
   if (SEGLEN <= 1) return mode_static(); 
   
+  // Standby-Helligkeit festlegen (65% von 255)
+  const uint8_t standbyBri = 166; // 65%
+  const uint32_t standbyHoldDuration = 3000; // 2 Sekunden
+  
   // Bei Effektwechsel oder Init: Erzwinge Start bei Wipe-Phase
   if (SEGENV.call == 0) {
-    // Setze strip.now so dass wir am Anfang des Zyklus starten
-    SEGENV.aux0 = strip.now;  // Merke dir den Startzeitpunkt
+    SEGENV.aux0 = strip.now; 
   } 
   
   // Zeitdauern aus Slidern (in ms)
@@ -168,55 +171,49 @@ uint16_t mode_stairs(bool inverted) {
   // Wipe Tail Länge (Anzahl LEDs)
   uint16_t wipeTailLength = map(SEGMENT.custom2, 0, 255, 0, SEGLEN / 2); 
   
-  // Gesamtzykluszeit
-  uint32_t cycleTime = wipeDuration + holdDuration + fadeDuration + 500; // +500ms Pause
+  // Gesamtzykluszeit (NEU: muss alle Phasen umfassen)
+  uint32_t cycleTime = wipeDuration + holdDuration + fadeDuration + standbyHoldDuration + wipeDuration + 1500; // +1500ms Pause
   
-  // Aktuelle Position im Zyklus (0 bis cycleTime-1)
-  // Berechne relativ zum Startzeitpunkt
+  // Aktuelle Position im Zyklus
   uint32_t pos = (strip.now - SEGENV.aux0) % cycleTime;
   
   uint32_t color = SEGCOLOR(1);
+  
+  // Startzeiten für die nachfolgenden Phasen HIER DEKLARIEREN (Fix des Fehlers)
+  uint32_t fadeStart    = wipeDuration + holdDuration;
+  uint32_t standbyStart = fadeStart + fadeDuration;
+  uint32_t wipeNegStart = standbyStart + standbyHoldDuration;
+  uint32_t pauseStart   = wipeNegStart + wipeDuration; // NEU: Pause-Startzeitpunkt
   
   // ===== PHASE 1: WIPE (0 bis wipeDuration) =====
   if (pos < wipeDuration) {
     
     // Wipe-Progress: 0.0 bis 1.0
     float wipeProgress = (float)pos / (float)wipeDuration;
-    
-    // Aktuelle Wipe-Position (kann über SEGLEN hinausgehen für smooth finish)
     float wipePos = wipeProgress * (SEGLEN + wipeTailLength);
     
     for (uint16_t i = 0; i < SEGLEN; i++) {
-      // Invertierung: Kehre die Laufrichtung um
       uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
       
-      // Bei SEGMENT.reverse die Richtung zusätzlich umkehren
-      if (SEGMENT.reverse) {
-        idx = SEGLEN - 1 - idx;
-      }
-      
-      // Distanz zur Wipe-Front
       float distanceToFront = wipePos - i;
       
       if (distanceToFront >= wipeTailLength) {
-        // Voll beleuchtet - vor dem Tail
         SEGMENT.setPixelColor(idx, color);
       } 
       else if (distanceToFront > 0) {
-        // Im Tail - sanfter Gradient von 100% zu 0%
         float tailProgress = distanceToFront / (float)wipeTailLength;
         uint8_t tailBri = (uint8_t)(255.0f * tailProgress);
         SEGMENT.setPixelColor(idx, dimColor(color, tailBri));
       } 
       else {
-        // Noch nicht erreicht - komplett aus
         SEGMENT.setPixelColor(idx, BLACK);
       }
     }
   }
   
-  // ===== PHASE 2: HOLD (wipeDuration bis wipeDuration+holdDuration) =====
-  else if (pos < wipeDuration + holdDuration) {
+  // ===== PHASE 2: HOLD (wipeDuration bis fadeStart) =====
+  else if (pos < fadeStart) {
     
     // Alle LEDs voll an
     for (uint16_t i = 0; i < SEGLEN; i++) {
@@ -226,17 +223,16 @@ uint16_t mode_stairs(bool inverted) {
     }
   }
   
-  // ===== PHASE 3: FADE (wipeDuration+holdDuration bis wipeDuration+holdDuration+fadeDuration) =====
-  else if (pos < wipeDuration + holdDuration + fadeDuration) {
+  // ===== PHASE 3: FADE ZU STANDBY (fadeStart bis standbyStart) =====
+  else if (pos < standbyStart) {
     
-    uint32_t fadeStart = wipeDuration + holdDuration;
     uint32_t fadePos = pos - fadeStart;
     
     // Fade-Progress: 0.0 bis 1.0
     float fadeProgress = (float)fadePos / (float)fadeDuration;
     
-    // Helligkeit von 255 nach 0
-    uint8_t bri = (uint8_t)(255.0f * (1.0f - fadeProgress));
+    // Helligkeit von 255 nach standbyBri (127)
+    uint8_t bri = (uint8_t)(255.0f - (255.0f - standbyBri) * fadeProgress);
     
     for (uint16_t i = 0; i < SEGLEN; i++) {
       uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
@@ -245,27 +241,73 @@ uint16_t mode_stairs(bool inverted) {
     }
   }
   
-  // ===== PHASE 4: PAUSE (Rest des Zyklus) =====
-  else {
+  // ===== PHASE 4: STANDBY HOLD (standbyStart bis wipeNegStart) =====
+  else if (pos < wipeNegStart) {
     
-    // Alle LEDs aus
+    // Alle LEDs auf Standby-Helligkeit
     for (uint16_t i = 0; i < SEGLEN; i++) {
       uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
       if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
-      SEGMENT.setPixelColor(idx, BLACK);
+      SEGMENT.setPixelColor(idx, dimColor(color, standbyBri));
     }
+  }
+
+  // ===== PHASE 5: NEGATIVE WIPE (wipeNegStart bis pauseStart) =====
+  else if (pos < pauseStart) {
+    
+    uint32_t wipePosRel = pos - wipeNegStart;
+    
+    // Wipe-Progress: 0.0 bis 1.0
+    float wipeProgress = (float)wipePosRel / (float)wipeDuration;
+    
+    // Die Aus-Welle bewegt sich von der Mitte (SEGLEN/2) nach außen (0 und SEGLEN).
+    // Der Fortschritt geht von 0 bis SEGLEN / 2
+    float wipeDistance = wipeProgress * (SEGLEN / 2.0f + wipeTailLength); 
+    
+    for (uint16_t i = 0; i < SEGLEN; i++) {
+      uint16_t idx = inverted ? i : (SEGLEN - 1 - i);
+      if (SEGMENT.reverse) idx = SEGLEN - 1 - idx;
+
+      // Abstand des Pixels zur Mitte (0.0 bis SEGLEN/2)
+      float distanceToCenter = abs(i - (SEGLEN / 2.0f)); 
+      
+      // Abstand des Pixels zur aktuellen Wipe-Front
+      float distanceToFront = wipeDistance - distanceToCenter;
+      
+      if (distanceToFront >= wipeTailLength) {
+        // Voll ausgeschaltet - nach dem Tail
+        SEGMENT.setPixelColor(idx, BLACK);
+      } 
+      else if (distanceToFront > 0) {
+        // Im Tail - sanfter Gradient von Standby-Helligkeit (127) zu 0%
+        float tailProgress = distanceToFront / (float)wipeTailLength;
+        // Helligkeit geht von 127 (StandbyBri) nach 0
+        uint8_t tailBri = (uint8_t)(standbyBri * (1.0f - tailProgress));
+        SEGMENT.setPixelColor(idx, dimColor(color, tailBri));
+      } 
+      else {
+        // Noch nicht erreicht - auf Standby-Helligkeit
+        SEGMENT.setPixelColor(idx, dimColor(color, standbyBri));
+      }
+    }
+  }
+
+  // ===== PHASE 6: PAUSE (Rest des Zyklus) =====
+  else {
+    
+    // Alle LEDs aus
+    SEGMENT.fill(BLACK); 
   }
   
   // Automatischer Neustart wenn wir wieder am Zyklusanfang sind
-  // (pos springt von cycleTime-1 zurück auf 0 durch Modulo)
-  if (pos < 10 && SEGENV.step == 1) {  // Erste 10ms des neuen Zyklus
-    SEGENV.aux0 = strip.now;  // Neuer Startzeitpunkt
+  if (pos < 10 && SEGENV.step == 1) { 
+    SEGENV.aux0 = strip.now; 
     SEGENV.step = 0;
   }
   
   // Markiere Zyklusende in der Pause-Phase
-  if (pos >= wipeDuration + holdDuration + fadeDuration + 450) {
-    SEGENV.step = 1;  // Zyklus fast vorbei
+  if (pos >= pauseStart + 1450) { 
+    SEGENV.step = 1; 
   }
   
   return FRAMETIME;
